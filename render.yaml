@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: titanickidplays-multiplayer
+    runtime: node
+    plan: free
+    buildCommand: npm install --omit=dev
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: ALLOWED_GAMES
+        value: PrimateLab,CarnivalHorror
+      - key: ALLOWED_ORIGINS
+        value: https://tkp-game-primate-lab.netlify.app,https://tkp-game-carnival-horror.netlify.app,https://titanickidplays.ca

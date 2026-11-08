@@ -1,0 +1,13 @@
+{
+  "name": "titanic-kid-plays-shared-multiplayer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Private 4-player multi-game WebSocket rooms for Titanic Kid Plays",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test tests/*.test.cjs"
+  }
+}
