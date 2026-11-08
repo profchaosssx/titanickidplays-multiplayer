@@ -1,5 +1,5 @@
 'use strict';
-// PRIMATE V12 prototype: zero-dependency WebSocket room server. Requires Node 20+.
+// Titanic Kid Plays shared multiplayer v2: resumable WebSocket room server. Requires Node 20+.
 // Place behind HTTPS/WSS reverse proxy for Quest/Netlify public play.
 const http = require('node:http');
 const crypto = require('node:crypto');
@@ -11,6 +11,8 @@ const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 const MAX_MESSAGE = 65536;
 const MAX_ROOMS = 120;
 const MAX_PLAYERS = 4;
+const RESUME_GRACE_MS = 120000;
+const HOST_FAILOVER_MS = 12000;
 const rooms = new Map();
 const clients = new Set();
 const avatars = ['#c7ec77','#6ce2e8','#e0a7f9','#f7bf77'];
@@ -23,11 +25,11 @@ const server = http.createServer((req,res)=>{
   const pathname = new URL(req.url, 'http://localhost').pathname;
   if(pathname==='/health'){
     res.writeHead(200,{'Content-Type':'application/json','Cache-Control':'no-store','Access-Control-Allow-Origin':'*'});
-    res.end(JSON.stringify({ok:true,service:'titanic-kid-plays-shared',version:1,rooms:rooms.size,players:clients.size}));return;
+    res.end(JSON.stringify({ok:true,service:'titanic-kid-plays-shared',version:2,rooms:rooms.size,players:clients.size}));return;
   }
   if(pathname==='/'){
     res.writeHead(200,{'Content-Type':'application/json','Cache-Control':'no-store'});
-    res.end(JSON.stringify({service:'Titanic Kid Plays Multiplayer',version:1,ok:true,health:'/health',socket:'/socket',mode:'private-rooms'}));return;
+    res.end(JSON.stringify({service:'Titanic Kid Plays Multiplayer',version:2,ok:true,health:'/health',socket:'/socket',mode:'private-rooms'}));return;
   }
   res.writeHead(404);res.end('Not found');
 });
@@ -40,15 +42,34 @@ function send(client,obj){if(client.closed||!client.socket.writable||client.sock
 function frame(client,opcode,data=Buffer.alloc(0)){if(client.closed||!client.socket.writable)return;const length=data.length;if(length>65535)return;const h=length<126?Buffer.from([0x80|opcode,length]):Buffer.from([0x80|opcode,126,length>>8,length&255]);client.socket.write(Buffer.concat([h,data]));}
 function sendError(c,message){send(c,{type:'error',message});}
 function sendToRoom(room,obj,exceptId=null){for(const c of room.members.values())if(c.id!==exceptId)send(c,obj);}
-function roster(room){return {type:'roster',room:room.code,gameId:room.gameId,hostId:room.hostId,players:Array.from(room.members.values(),c=>({id:c.id,name:c.name,color:c.color,pose:c.pose}))};}
+function roster(room){return {type:'roster',room:room.code,gameId:room.gameId,hostId:room.hostId,players:Array.from(room.members.values()).filter(c=>!c.closed).map(c=>({id:c.id,name:c.name,color:c.color,pose:c.pose}))};}
 function roomRoster(room){sendToRoom(room,roster(room));}
-function leaveRoom(c){const room=c.room;if(!room)return;c.room=null;room.members.delete(c.id);if(!room.members.size){rooms.delete(room.code);return;}if(room.hostId===c.id){room.hostId=room.members.keys().next().value;sendToRoom(room,{type:'notice',message:'Room host changed. World control transferred.'});}
+function leaveRoom(c){const room=c.room;if(!room)return;c.room=null;room.members.delete(c.id);if(!room.members.size){rooms.delete(room.code);return;}if(room.hostId===c.id){room.hostId=Array.from(room.members.values()).find(p=>!p.closed)?.id||room.members.keys().next().value;sendToRoom(room,{type:'notice',message:'Room host changed. World control transferred.'});}
   roomRoster(room);
 }
+function reserveDisconnected(c){
+  if(!c.room)return;
+  c.disconnectedAt=now();
+  roomRoster(c.room);
+}
+function resumeRoom(c,m){
+  const code=String(m.code||'').toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,6);
+  const room=rooms.get(code);
+  if(!room||room.gameId!==m.gameId){send(c,{type:'error',code:'ROOM_EXPIRED',message:'The room was reset. Create a new room and share its code.'});return;}
+  const old=Array.from(room.members.values()).find(p=>p.closed&&p.resumeToken===m.resumeToken&&typeof m.resumeToken==='string'&&p.disconnectedAt&&now()-p.disconnectedAt<RESUME_GRACE_MS);
+  if(!old){send(c,{type:'error',code:'RESUME_EXPIRED',message:'Your place in this room expired. Join again using the room code.'});return;}
+  c.id=old.id;c.name=old.name;c.color=old.color;c.pose=old.pose;c.lastPose=0;c.lastWorld=0;c.resumeToken=old.resumeToken;c.room=room;c.disconnectedAt=0;
+  old.room=null;room.members.set(c.id,c);
+  send(c,{type:'joined',room:room.code,gameId:room.gameId,seed:room.seed,id:c.id,hostId:room.hostId,color:c.color,resumeToken:c.resumeToken,resumed:true});
+  if(room.latestWorld)send(c,{type:'world',world:room.latestWorld,seq:room.seq});
+  roomRoster(room);
+  send(c,{type:'notice',message:'Reconnected to your room.'});
+}
+
 function joinRoom(c,room){if(c.room)leaveRoom(c);if(room.members.size>=MAX_PLAYERS){sendError(c,'Room is full (4 players).');return;}
-  c.room=room;c.name=safeText(c.requestedName);const colorsInUse=new Set(Array.from(room.members.values(),p=>p.color));c.color=avatars.find(col=>!colorsInUse.has(col))||avatars[0];room.members.set(c.id,c);
+  c.room=room;c.name=safeText(c.requestedName);c.resumeToken=crypto.randomBytes(24).toString('hex');const colorsInUse=new Set(Array.from(room.members.values(),p=>p.color));c.color=avatars.find(col=>!colorsInUse.has(col))||avatars[0];room.members.set(c.id,c);
   if(!room.hostId)room.hostId=c.id;
-  send(c,{type:'joined',room:room.code,gameId:room.gameId,seed:room.seed,id:c.id,hostId:room.hostId,color:c.color});
+  send(c,{type:'joined',room:room.code,gameId:room.gameId,seed:room.seed,id:c.id,hostId:room.hostId,color:c.color,resumeToken:c.resumeToken});
   if(room.latestWorld)send(c,{type:'world',world:room.latestWorld,seq:room.seq});
   roomRoster(room);
 }
@@ -74,6 +95,7 @@ function allowedAction(c,a){if(!a||typeof a.kind!=='string')return false;
   return false;
 }
 function handle(c,m){if(!m||typeof m!=='object'||Array.isArray(m))return;
+  if(m.type==='resume'){resumeRoom(c,m);return;}
   if(m.type==='create'){
     if(c.room){sendError(c,'Leave your current room before creating another.');return;}
     if(rooms.size>=MAX_ROOMS){sendError(c,'Room capacity reached.');return;}
@@ -82,7 +104,7 @@ function handle(c,m){if(!m||typeof m!=='object'||Array.isArray(m))return;
   }
   if(m.type==='join'){
     if(c.room){sendError(c,'Leave your current room before joining another.');return;}
-    const room=rooms.get(String(m.code||'').toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,6));if(!room){sendError(c,'Room not found. Check the six-character code.');return;}
+    const room=rooms.get(String(m.code||'').toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,6));if(!room){send(c,{type:'error',code:'ROOM_EXPIRED',message:'Room not found. The server may have restarted. Create a new room.'});return;}
     const gameId=String(m.gameId||'PrimateLab');if(room.gameId!==gameId){sendError(c,'That room belongs to another game. Open the correct game to join.');return;}
     c.requestedName=safeText(m.name);joinRoom(c,room);return;
   }
@@ -118,9 +140,9 @@ server.on('upgrade',(req,socket,head)=>{
   const accept=crypto.createHash('sha1').update(key+WS_GUID).digest('base64');
   socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: '+accept+'\r\n\r\n');
   socket.setNoDelay(true);socket.setTimeout(0);
-  const c={id:crypto.randomBytes(6).toString('hex'),socket,closed:false,buffer:Buffer.alloc(0),room:null,pose:null,name:'PLAYER',requestedName:'PLAYER',color:avatars[0],lastPose:0,lastWorld:0,actionCount:0,actionWindow:0,lastSeen:now()};
+  const c={id:crypto.randomBytes(6).toString('hex'),socket,closed:false,disconnectedAt:0,resumeToken:null,buffer:Buffer.alloc(0),room:null,pose:null,name:'PLAYER',requestedName:'PLAYER',color:avatars[0],lastPose:0,lastWorld:0,actionCount:0,actionWindow:0,lastSeen:now()};
   clients.add(c);send(c,{type:'hello',id:c.id,protocol:13,maxPlayers:MAX_PLAYERS,games:allowedGames});
-  const close=()=>{if(c.closed)return;c.closed=true;clients.delete(c);leaveRoom(c);try{socket.destroy();}catch(_){}};
+  const close=()=>{if(c.closed)return;c.closed=true;clients.delete(c);reserveDisconnected(c);try{socket.destroy();}catch(_){}};
   socket.on('error',close);socket.on('close',close);socket.on('end',close);
   function parse(){while(c.buffer.length>=2){const b=c.buffer,op=b[0]&15,fin=!!(b[0]&128),masked=!!(b[1]&128);let size=b[1]&127,offset=2;
       if(size===126){if(b.length<4)return;size=b.readUInt16BE(2);offset=4;}
@@ -137,7 +159,21 @@ server.on('upgrade',(req,socket,head)=>{
 setInterval(()=>{
   for(const c of clients){if(now()-c.lastSeen>120000){c.socket.destroy();continue;}frame(c,9);}
 },10000);
-setInterval(()=>{for(const r of rooms.values())if(r.members.size)sendToRoom(r,roster(r));},100);
+setInterval(()=>{
+  const time=now();
+  for(const room of rooms.values()){
+    for(const c of [...room.members.values()])if(c.closed&&c.disconnectedAt&&time-c.disconnectedAt>RESUME_GRACE_MS){
+      room.members.delete(c.id);c.room=null;
+    }
+    if(!room.members.size){rooms.delete(room.code);continue;}
+    const host=room.members.get(room.hostId);
+    if(!host||host.closed&&host.disconnectedAt&&time-host.disconnectedAt>HOST_FAILOVER_MS){
+      const next=[...room.members.values()].find(c=>!c.closed);
+      if(next&&next.id!==room.hostId){room.hostId=next.id;sendToRoom(room,{type:'notice',message:'Host disconnected. World control moved to another player.'});}
+    }
+  }
+},1000);
+setInterval(()=>{for(const room of rooms.values())roomRoster(room);},100);
 server.listen(PORT,HOST,()=>console.log(`Titanic Kid Plays shared multiplayer: http://${HOST}:${PORT} | WebSocket /socket | /health | games: ${allowedGames.join(', ')}`));
 function shutDown(){for(const c of clients){send(c,{type:'notice',message:'Server restarting'});c.socket.destroy();}server.close(()=>process.exit(0));}
 process.on('SIGINT',shutDown);process.on('SIGTERM',shutDown);
